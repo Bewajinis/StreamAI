@@ -1,0 +1,290 @@
+/**
+ * DEVELOPMENT MOCK STREAM (server-only)
+ *
+ * Stands in for Anthropic so the whole chat experience — thinking indicator,
+ * token-by-token Markdown, auto-scroll, Stop, multi-turn history — can be
+ * exercised without a funded API key. It is a pure function of the incoming
+ * conversation: no network call, no credentials, nothing to configure.
+ *
+ * SWITCH (see `resolveChatMode()` in `./config.ts`)
+ *  - Selected server-side only, by `CHAT_MODE`. The client cannot force it.
+ *  - The default is mock only under `next dev` (`NODE_ENV=development`);
+ *    production, tests and an unset `NODE_ENV` default to Anthropic, so a
+ *    deployed build only ever serves this when `CHAT_MODE=mock` is set
+ *    deliberately — and it says so loudly in the server log once.
+ *
+ * CONTRACT WITH THE REAL PATH
+ * The reply is written through the AI SDK's UI message stream
+ * (`createUIMessageStream` + `createUIMessageStreamResponse`), exactly the
+ * protocol `streamText().toUIMessageStreamResponse()` emits and
+ * `DefaultChatTransport` parses. The route therefore behaves identically in
+ * both modes: same validation, same error envelope, same `Stop` semantics
+ * (the route forwards `request.signal`, this module watches it).
+ *
+ * LABELLING: every mock reply opens with a quoted "Development mock" line, the
+ * `start` chunk carries `{ mock: true }` metadata (the UI shows a badge), and
+ * the response header is `x-chat-mode: mock`. Simulated output is never
+ * mistaken for a real Claude answer.
+ */
+
+import "server-only";
+import {
+  createUIMessageStream,
+  createUIMessageStreamResponse,
+  type UIMessage,
+} from "ai";
+import { mockTiming } from "./config";
+
+/**
+ * Opening line of every mock reply — the in-text label that survives copy,
+ * paste, and history round trips (unlike metadata, which only reaches the UI).
+ */
+export const MOCK_REPLY_LEAD =
+  "> **Development mock** — this reply was produced by the local test harness, not by Claude.";
+
+/** Badge text rendered next to assistant turns streamed in mock mode. */
+export const MOCK_BADGE = "Development mock — not a real Claude response.";
+
+/** Text part id used for the single streamed text block. */
+const TEXT_PART_ID = "mock-text";
+
+/* ------------------------------------------------------------------------ *
+ * Conversation helpers
+ * ------------------------------------------------------------------------ */
+
+/** Plain text of a UI message; the mock only ever reads text parts. */
+function plainText(message: UIMessage): string {
+  let text = "";
+  for (const part of message.parts) {
+    if (part.type === "text") text += part.text;
+  }
+  return text;
+}
+
+/** One line of a user/assistant turn, trimmed for display inside a reply. */
+function quote(text: string, max = 110): string {
+  const cleaned = text.replace(/\s+/g, " ").trim();
+  if (cleaned.length <= max) return cleaned;
+  return `${cleaned.slice(0, max - 1).trimEnd()}…`;
+}
+
+/* ------------------------------------------------------------------------ *
+ * Reply body
+ * ------------------------------------------------------------------------ */
+
+/**
+ * Builds the simulated answer for a conversation.
+ *
+ * Deliberately history-aware: it reports how many turns it received and quotes
+ * the first and latest user messages, so a regression that drops or reorders
+ * history shows up in the reply itself. The body carries a list, a quote, a
+ * fenced block and a table so the streaming Markdown renderer is exercised
+ * end to end, and it is long enough (~150 tokens) to be stopped mid-stream.
+ */
+export function buildMockReply(messages: UIMessage[], tokenDelayMs: number): string {
+  const userTurns: string[] = [];
+  const assistantTurns: string[] = [];
+
+  for (const message of messages) {
+    const text = plainText(message).trim();
+    if (message.role === "user") {
+      if (text.length > 0) userTurns.push(text);
+    } else if (text.length > 0) {
+      assistantTurns.push(text);
+    }
+  }
+
+  const turn = userTurns.length;
+  const first = quote(userTurns[0] ?? "");
+  const latest = quote(userTurns[turn - 1] ?? "");
+  const previous = assistantTurns.length > 0 ? quote(assistantTurns[assistantTurns.length - 1], 90) : null;
+
+  return [
+    MOCK_REPLY_LEAD,
+    "",
+    "### This run",
+    "",
+    `- **User turns received:** ${turn} (assistant replies on record: ${assistantTurns.length})`,
+    `- **First message:** "${first}"`,
+    `- **Latest message:** "${latest}"`,
+    previous === null
+      ? "- **Previous reply:** none yet — this is the first turn."
+      : `- **Previous reply:** "${previous}"`,
+    "",
+    "The mock reads the whole conversation, so earlier turns survive:",
+    "",
+    previous === null
+      ? "> Nothing to quote yet. Ask a follow-up and this section will echo your first message back."
+      : `> You started with "${first}", the assistant answered "${previous}", and now you asked "${latest}".`,
+    "",
+    "Structure for the streaming Markdown renderer:",
+    "",
+    "```ts",
+    "// generated by src/lib/ai/mock.ts — no model is involved",
+    `const turn = ${turn};`,
+    `const mode = "mock";`,
+    "```",
+    "",
+    "| field | value |",
+    "| --- | --- |",
+    "| mode | mock (local development) |",
+    `| token delay | ${tokenDelayMs} ms |`,
+    `| user turns | ${turn} |`,
+    "",
+    "Press **Stop** mid-stream to keep the partial reply; the composer re-enables",
+    "as soon as the turn settles, so the next message goes out immediately.",
+  ].join("\n");
+}
+
+/**
+ * Splits text into token-sized deltas.
+ *
+ * Whitespace is attached to the word that follows it so a delta reads like a
+ * real model token rather than a bare gap, and over-long words are cut into
+ * fixed-size pieces the way a subword tokenizer would. Concatenating every
+ * token reproduces the input exactly — the tests rely on that.
+ */
+export function tokenizeMockText(text: string): string[] {
+  const tokens: string[] = [];
+  let pendingWhitespace = "";
+
+  const push = (chunk: string) => {
+    let rest = chunk;
+    while (rest.length > 14) {
+      tokens.push(rest.slice(0, 14));
+      rest = rest.slice(14);
+    }
+    if (rest.length > 0) tokens.push(rest);
+  };
+
+  for (const part of text.split(/(\s+)/)) {
+    if (part.length === 0) continue;
+
+    if (/^\s+$/.test(part)) {
+      pendingWhitespace += part;
+      continue;
+    }
+
+    push(pendingWhitespace + part);
+    pendingWhitespace = "";
+  }
+
+  if (pendingWhitespace.length > 0) push(pendingWhitespace);
+  return tokens;
+}
+
+/* ------------------------------------------------------------------------ *
+ * Pacing
+ * ------------------------------------------------------------------------ */
+
+/**
+ * Waits, waking early if the client aborts.
+ *
+ * @returns `true` when the wait ended because the signal fired — the caller
+ * must stop streaming immediately, which is what makes Stop feel instant even
+ * though a token is mid-flight.
+ */
+function wait(ms: number, signal: AbortSignal): Promise<boolean> {
+  if (signal.aborted) return Promise.resolve(true);
+  if (ms <= 0) return Promise.resolve(false);
+
+  return new Promise<boolean>((resolve) => {
+    const onAbort = () => {
+      clearTimeout(timer);
+      resolve(true);
+    };
+    const timer = setTimeout(() => {
+      signal.removeEventListener("abort", onAbort);
+      resolve(false);
+    }, ms);
+    signal.addEventListener("abort", onAbort, { once: true });
+  });
+}
+
+/** One-time log line so the active mode is never invisible to the operator. */
+let modeReported = false;
+
+function reportMockMode(): void {
+  if (modeReported) return;
+  modeReported = true;
+
+  if (process.env.NODE_ENV === "production") {
+    console.warn(
+      "[chat] MOCK MODE ACTIVE IN PRODUCTION (CHAT_MODE=mock): replies are simulated and no model is called.",
+    );
+  } else {
+    console.log(
+      "[chat] mock mode active: replies are simulated. Set CHAT_MODE=anthropic in .env.local to call Claude.",
+    );
+  }
+}
+
+/* ------------------------------------------------------------------------ *
+ * Response
+ * ------------------------------------------------------------------------ */
+
+/**
+ * Streams a simulated reply for the validated conversation.
+ *
+ * Chunk sequence mirrors `streamText`: `start` (carrying mock metadata so the
+ * UI can badge it) → optional thinking beat → `text-start` → one `text-delta`
+ * per token → `text-end` → `finish`. If `signal` fires at any point the loop
+ * breaks, the text part is closed with `text-end`, an `abort` part is written
+ * and the stream ends — no `error` part is ever produced by cancellation, so
+ * the client's Stop path keeps the partial text instead of showing a failure.
+ */
+export function createMockChatResponse(options: {
+  messages: UIMessage[];
+  signal: AbortSignal;
+}): Response {
+  const { messages, signal } = options;
+  const { initialDelayMs, tokenDelayMs } = mockTiming();
+  const tokens = tokenizeMockText(buildMockReply(messages, tokenDelayMs));
+
+  reportMockMode();
+
+  const stream = createUIMessageStream({
+    // Unreachable in practice: every write below is guarded. If it is ever
+    // hit, the message stays generic — mock internals are not client data.
+    onError: () => "The mock stream failed unexpectedly.",
+    execute: async ({ writer }) => {
+      writer.write({ type: "start", messageMetadata: { mock: true, mode: "mock" } });
+
+      if (await wait(initialDelayMs, signal)) {
+        writer.write({ type: "abort" });
+        return;
+      }
+
+      writer.write({ type: "text-start", id: TEXT_PART_ID });
+
+      let cancelled = false;
+      for (const token of tokens) {
+        if (signal.aborted) {
+          cancelled = true;
+          break;
+        }
+        writer.write({ type: "text-delta", id: TEXT_PART_ID, delta: token });
+
+        // A random component keeps the cadence from sounding metronomic; it is
+        // suppressed at the near-zero delays tests use so they stay fast.
+        const jitter = tokenDelayMs > 4 ? Math.floor(Math.random() * tokenDelayMs * 0.5) : 0;
+        if (await wait(tokenDelayMs + jitter, signal)) {
+          cancelled = true;
+          break;
+        }
+      }
+
+      writer.write({ type: "text-end", id: TEXT_PART_ID });
+      if (cancelled) {
+        writer.write({ type: "abort" });
+        return;
+      }
+      writer.write({ type: "finish", finishReason: "stop" });
+    },
+  });
+
+  return createUIMessageStreamResponse({
+    stream,
+    headers: { "x-chat-mode": "mock" },
+  });
+}
